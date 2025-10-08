@@ -1,5 +1,13 @@
 from typing import List
-import numpy as np
+
+# --- GPU/Device Setup ---
+try:
+    import cupy as np
+    np.cuda.runtime.getDeviceCount() # Check for GPU
+    IS_GPU = True
+except (ImportError, np.cuda.runtime.CUDARuntimeError):
+    import numpy as np
+    IS_GPU = False
 
 # Tensor class, with __init__, backward, magic methods, and utils:
 class Tensor:
@@ -18,8 +26,7 @@ class Tensor:
         self.operation = operation
         self.children = []
         self.shape = self._data.shape
-        if self.requires_grad:
-            self.grad = np.zeros_like(data)
+        self.grad = None # Lazy initialization of gradient
 
     def __repr__(self):
         return f"""({self._data}, requires_grad = {self.requires_grad})"""
@@ -37,9 +44,13 @@ class Tensor:
             return "this tensor has requires_grad set to False"
         
         if grad is None:
-            grad = np.ones_like(self._data)
+            grad = np.ones_like(self._data, dtype=np.float32)
 
-        self.grad += grad
+        # Initialize gradient if it's None
+        if self.grad is None:
+            self.grad = grad
+        else:
+            self.grad += grad
 
         if z is not None:
             self.children.remove(z)
@@ -58,7 +69,7 @@ class Tensor:
     
     def zero_grad(self):
         ''' Reset the Tensor's gradients to zero. '''
-        self.grad = np.zeros_like(self._data)
+        self.grad = None # Resetting to None frees the memory
 
     def zero_grad_tree(self):
         ''' Reset the gradients of this Tensor, and of all of the Tensors that led to it. '''
@@ -86,17 +97,17 @@ class Tensor:
     def __sub__(self, other):
         """ New = self - other """
         op=Sub()
-        return op.forward( self , other)
+        return op.forward( self , tensor(other))
 
     def __rsub__(self, other):
         """ New = other - self """
         op=Sub()
-        return op.forward( other , self)
+        return op.forward( tensor(other) , self)
 
     def __isub__(self, other):
         """ self -= other """
         op=Sub()
-        return op.forward( self , other)
+        return op.forward( self , tensor(other))
     
     def __neg__(self):
         """ self = -self """
@@ -184,6 +195,21 @@ class Tensor:
         """
         op = Var()
         return op.forward(self, dim, keepdims=keepdims)
+
+    def exp(self):
+        """ Returns e^self """
+        op = Exp()
+        return op.forward(self)
+
+    def log(self):
+        """ Returns the natural logarithm of self """
+        op = Log()
+        return op.forward(self)
+
+    def sqrt(self):
+        """ Returns the square root of self """
+        op = Sqrt()
+        return op.forward(self)
 
     def reshape(self, *shape):
         """
@@ -633,17 +659,22 @@ class Sum:
         # Add new Tensors to "children" and old Tensors to "parents":
         self.parents = (a,)
         a.children.append(z)
-        self.cache = (a)
+        self.cache = (a, dim, keepdims)
 
         return z
     
     def backward(self, dz, z):
-        a =  self.cache
+        a, dim, keepdims =  self.cache
         
         # Find gradients relative to "a", and pass it downstream:
         if a.requires_grad:
-            # Expand upstream gradients to the shape of "a":
-            da = np.ones(a.shape) * dz
+            # If keepdims=False, the upstream gradient dz is missing the reduced dimension.
+            # We must add it back to broadcast correctly.
+            if not keepdims:
+                dz = np.expand_dims(dz, axis=dim)
+            
+            # Now we can broadcast the gradient back to the original shape
+            da = np.ones_like(a._data) * dz
             a.backward(da, z)
 
 
@@ -661,18 +692,25 @@ class Mean:
         # Add new Tensors to "children" and old Tensors to "parents":
         self.parents = (a,)
         a.children.append(z)
-        self.cache = (a, dim)
+        self.cache = (a, dim, keepdims)
 
         return z
     
     def backward(self, dz, z):
-        a, dim =  self.cache
+        a, dim, keepdims =  self.cache
         
         # Find gradients relative to "a", and pass it downstream:
         if a.requires_grad:
-            # Propagate through the mean(x) operation:
-            da = np.ones(a.shape) * dz
-            da /= np.prod(np.array(a.shape)[dim])
+            if not keepdims:
+                dz = np.expand_dims(dz, axis=dim)
+
+            if dim is None:
+                size = a._data.size
+            else:
+                size = a.shape[dim]
+            
+            da = (1 / size) * dz
+            da = np.ones_like(a._data) * da
             a.backward(da, z)
 
 
@@ -683,34 +721,41 @@ class Max:
       
         # Get new Tensor's data:
         data = np.max(a._data, axis=dim, keepdims=keepdims)
-        if keepdims:
-            data = np.ones(a.shape) * data
-
+        
         # Create new Tensor:
         z = Tensor(data, requires_grad=requires_grad, operation=self) 
      
         # Add new Tensors to "children" and old Tensors to "parents":
         self.parents = (a,)
         a.children.append(z)
-        self.cache = (a, data, dim)
+        self.cache = (a, dim, keepdims)
 
         return z
     
     def backward(self, dz, z):
-        a, data, dim =  self.cache
+        a, dim, keepdims =  self.cache
 
         # Find gradients relative to "a", and pass it downstream:
         if a.requires_grad:
-            max = data
-            if a.shape != dz.shape: 
-                # Brodcast upstream derivative to the size of "a":
+            # Create a mask that is True only at the position of the first max value.
+            # This handles ties by only backpropagating to the first occurrence.
+            # CuPy does not have `put_along_axis`, so we replicate it by creating a one-hot mask.
+            max_indices = np.argmax(a._data, axis=dim)
+            
+            # Create a one-hot encoding of the max indices.
+            # This is equivalent to what np.put_along_axis(..., True) would do.
+            one_hot_mask = np.eye(a.shape[dim])[max_indices]
+            
+            # Reshape the one-hot mask to match the original tensor's shape for broadcasting.
+            mask = np.moveaxis(one_hot_mask, -1, dim).astype(bool)
+            
+            # If keepdims=False was used, the upstream gradient `dz` will be missing
+            # the dimension that was reduced. We need to add it back for broadcasting.
+            if not keepdims:
                 dz = np.expand_dims(dz, axis=dim)
-                dz = dz * np.ones_like(a._data)
-                # Brodcast upstream output (max) to the size of "a":
-                max = np.expand_dims(data, axis=dim)
-                max = max * np.ones_like(a._data)
-            # Add upstream gradients to the [max] values:
-            da = dz * np.equal(a._data, max)
+
+            # Route the broadcasted gradient only to the max values.
+            da = mask * dz
             a.backward(da, z)
             
 
@@ -728,19 +773,25 @@ class Var:
         # Add new Tensors to "children" and old Tensors to "parents":
         self.parents = (a,)
         a.children.append(z)
-        self.cache = (a, dim)
+        self.cache = (a, dim, keepdims)
 
         return z
     
     def backward(self, dz, z):
-        a, dim =  self.cache
+        a, dim, keepdims =  self.cache
         
         # Find gradients relative to "a", and pass it downstream:
         if a.requires_grad:
-            # Propagate through the var(x) operation:
-            da = np.ones(a.shape) * dz
-            da = da * 2 * (a._data - a._data.mean(axis=dim, keepdims=True)) / np.prod(np.array(a.shape)[dim])
-            a.backward(da, z)
+            if not keepdims:
+                dz = np.expand_dims(dz, axis=dim)
+
+            if dim is None:
+                n = a._data.size
+            else:
+                n = a.shape[dim]
+            
+            grad_a = dz * (2 * (a._data - a._data.mean(axis=dim, keepdims=True))) / n
+            a.backward(grad_a, z)
 
 
 # Tensor Operations:
@@ -882,8 +933,8 @@ class MaskedFill:
     def forward(self, a, condition, value):
         requires_grad = a.requires_grad
       
-        # Get new Tensor's data:
-        data = np.where(condition, a._data, value)
+        # Get new Tensor's data: where condition is True, fill with value, otherwise keep original.
+        data = np.where(condition, value, a._data)
       
         # Create new Tensor:
         z = Tensor(data, requires_grad=requires_grad, operation=self) 
@@ -900,8 +951,8 @@ class MaskedFill:
         
         # Find gradients relative to "a", and pass it downstream:
         if a.requires_grad:
-            # Because some activations are just set to a value, this operation is not differentiable.
-            da = np.where(condition, dz, 0)
+            # Gradients are 0 where the values were filled, and pass through otherwise.
+            da = np.where(condition, 0, dz)
  
             a.backward(da, z)
 
@@ -943,12 +994,24 @@ def list(data):
         return data.tolist()
 
 def array(data):
-    if isinstance(data, np.ndarray):
+    # If data is already a cupy array (when np is cupy), just return it
+    if IS_GPU and isinstance(data, np.ndarray):
         return data
     if isinstance(data, Tensor):
         return data.toarray()
-    else: 
-        return np.array(data)
+    
+    # Use cupy's array function if on GPU, otherwise numpy's
+    # This handles conversion from lists, numpy arrays, etc.
+    if IS_GPU:
+        # np.asarray avoids unnecessary copies if data is already a cupy array
+        arr = np.asarray(data)
+    else:
+        arr = np.array(data)
+
+    # Default to float32 for floating point numbers to save memory
+    if np.issubdtype(arr.dtype, np.floating):
+        return arr.astype(np.float32)
+    return arr
     
 def tensor(data):
     if isinstance(data, Tensor):
