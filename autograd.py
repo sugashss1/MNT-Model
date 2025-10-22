@@ -43,18 +43,26 @@ class Tensor:
         if not self.requires_grad:
             return "this tensor has requires_grad set to False"
         
+        # Initialize the top-level gradient if it's the start of the chain
         if grad is None:
             grad = np.ones_like(self._data, dtype=np.float32)
 
-        # Initialize gradient if it's None
+        # Accumulate gradients
         if self.grad is None:
             self.grad = grad
         else:
             self.grad += grad
 
+        # --- Memory Optimization ---
+        # If this backward call came from a child tensor `z`, we can try to free memory.
         if z is not None:
-            self.children.remove(z)
+            # Remove the reference from the child to this parent, as its contribution is done.
+            if z in self.children:
+                self.children.remove(z)
         
+        # --- Graph Traversal ---
+        # Only propagate backwards if all children have backpropagated to this node.
+        # This ensures the gradient is fully accumulated before passing it to parents.
         if self.operation:
             if not self.children:
                 self.operation.backward(self.grad, self)
